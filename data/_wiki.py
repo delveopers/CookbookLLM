@@ -44,8 +44,6 @@ from tqdm import tqdm
 import logging, timeit, os
 
 logging.basicConfig(filename="wiki_scraper.log", level=logging.ERROR)
-current_dir = os.path.dirname(os.path.realpath(__file__))
-os.chdir(current_dir)
 
 def build_urls(query):
   new_query = "_".join(query.split(" "))
