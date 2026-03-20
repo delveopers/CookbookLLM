@@ -1,63 +1,12 @@
-import os, json, time, math
-import pickle
+import time, math
 from contextlib import nullcontext
 from typing import Dict, Any, Tuple
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
-import tiktoken
 
 from model import GPT
-
-def load_config(config_path: str, model_name: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-  with open(config_path, 'r') as f:
-    configs = json.load(f)
-  
-  if isinstance(configs, list):
-    configs = configs[0]  # taking first config if it's a list
-    # [0] => 500M
-    # [1] => 750M
-    # [2] => 1B
-
-  if model_name not in configs:
-    raise ValueError(f"Model '{model_name}' not found in config. Available: {list(configs.keys())}")
-  
-  model_config = configs[model_name]['ModelConfig']
-  train_config = configs[model_name]['TrainConfig']
-  
-  return model_config, train_config
-
-def prepare_dataset(data_path: str, train_split: float = 0.9) -> Tuple[torch.Tensor, torch.Tensor]:
-  """Load and prepare dataset for training"""
-  print("Loading dataset...")
-
-  with open(data_path, 'r', encoding='utf-8') as f:
-    text = f.read()  
-  print(f"Dataset loaded: {len(text):,} characters")
-
-  enc = tiktoken.get_encoding("cl100k_base")  # GPT-4 tokenizer  
-  print("Tokenizing dataset...")
-  tokens = enc.encode(text)
-  tokens = torch.tensor(tokens, dtype=torch.long)
-  print(f"Tokenized: {len(tokens):,} tokens")
-  
-  # train/validation split
-  n = int(train_split * len(tokens))
-  train_data = tokens[:n]
-  val_data = tokens[n:]
-
-  print(f"Train tokens: {len(train_data):,}")
-  print(f"Validation tokens: {len(val_data):,}")
-
-  return train_data, val_data
-
-def get_batch(data: torch.Tensor, batch_size: int, block_size: int, device: str) -> Tuple[torch.Tensor, torch.Tensor]:
-  """Generate a batch of data for training"""
-  ix = torch.randint(len(data) - block_size, (batch_size,))
-  x = torch.stack([data[i:i+block_size] for i in ix])
-  y = torch.stack([data[i+1:i+block_size+1] for i in ix])
-  x, y = x.to(device), y.to(device)
-  return x, y
+from config import ModelConfig, TrainConfig
+from dataset import prepare_dataset, get_batch
 
 @torch.no_grad()
 def estimate_loss(model: nn.Module, train_data: torch.Tensor, val_data: torch.Tensor, eval_iters: int, batch_size: int, block_size: int, device: str) -> Dict[str, float]:
@@ -161,21 +110,16 @@ def print_model_info(model: nn.Module, model_config: Dict[str, Any]) -> None:
   print("="*60)
 
 def main():
-  """Main training function"""
-  # configuration
-  config_path = "model_configs.json"
-  model_name = "GPT_500M"  # change this to "GPT_750M" or "GPT_1B" as needed
-  
+  """Main training function"""  
   # google-drive dataset URL (replace with your actual URL)
   dataset_url = "https://drive.google.com/"
   dataset_path = "dataset.txt"
 
   # load configurations
   print("Loading configurations...")
-  model_config, train_config = load_config(config_path, model_name)
 
   # set device
-  device = train_config['device']
+  device = TrainConfig.device
   if device == 'cuda' and not torch.cuda.is_available():
     device = 'cpu'
     print("CUDA not available, using CPU")
@@ -192,126 +136,127 @@ def main():
   print("Initializing model...")
 
   # create a params object with the configuration
-  class ModelConfig:
-    def __init__(self, config_dict):
-      for key, value in config_dict.items():
-        setattr(self, key, value)
-  
-  params = ModelConfig(model_config)
-  model = GPT(vocab_size=model_config['vocab_size'], params=params)
-  model.to(device)
-  
+  model = GPT(
+    vocab_size=ModelConfig.vocab_size,
+    params=ModelConfig
+  ).to(device)
+  model = model.to(memory_format=torch.channels_last)
+
+  torch.backends.cuda.matmul.allow_tf32 = True
+  torch.backends.cudnn.allow_tf32 = True
   # print model information
-  print_model_info(model, model_config)
+  print_model_info(model, vars(ModelConfig))
 
   # configure optimizer
-  optimizer = configure_optimizers(
-    model, 
-    weight_decay=train_config['weight_decay'],
-    learning_rate=train_config['learning_rate'],
-    betas=(train_config['beta1'], train_config['beta2'])
+  optimizer = configure_optimizers(model,
+    weight_decay=TrainConfig.weight_decay,
+    learning_rate=TrainConfig.learning_rate,
+    betas=(TrainConfig.beta1, TrainConfig.beta2)
   )
 
   # compiling model for faster training (PyTorch 2.0+)
-  if train_config.get('compile', False):
+  if getattr(TrainConfig, "compile", False):
     print("Compiling model...")
     try:
       model = torch.compile(model)
       print("Model compiled successfully!")
     except:
       print("Model compilation failed, continuing without compilation")
-  
+
   # Training setup
-  scaler = torch.cuda.amp.GradScaler(enabled=(train_config.get('dtype') == 'bfloat16'))
-  ctx = nullcontext() if device == 'cpu' else torch.amp.autocast(device_type=device, dtype=torch.bfloat16)
+  use_amp = TrainConfig.dtype == "float16"
+  scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+  ctx = nullcontext() if device == "cpu" else torch.autocast(
+    device_type=device,
+    dtype=torch.bfloat16 if TrainConfig.dtype == "bfloat16" else torch.float16
+  )
   
   # Training parameters
-  max_iters = train_config.get('max_iters', 600000)
-  batch_size = train_config['batch_size']
-  block_size = train_config['block_size']
-  gradient_accumulation_steps = train_config.get('gradient_accumulation_steps', 1)
-  grad_clip = train_config.get('grad_clip', 1.0)
-  eval_interval = train_config['eval_interval']
-  eval_iters = train_config['eval_iters']
-  log_interval = train_config.get('log_interval', 1)
-  
-  # Learning rate schedule parameters
-  warmup_steps = train_config['warmup_steps']
-  lr_decay_steps = train_config['lr_decay_steps']
-  learning_rate = train_config['learning_rate']
-  min_lr = train_config['min_lr']
-  
+  batch_size = TrainConfig.batch_size
+  block_size = TrainConfig.block_size
+  gradient_accumulation_steps = TrainConfig.gradient_accumulation_steps
+  grad_clip = TrainConfig.grad_clip
+  eval_interval = TrainConfig.eval_interval
+  eval_iters = TrainConfig.eval_iters
+  log_interval = TrainConfig.log_interval
+
+  warmup_steps = TrainConfig.warmup_steps
+  lr_decay_steps = TrainConfig.lr_decay_steps
+  learning_rate = TrainConfig.learning_rate
+  min_lr = TrainConfig.min_lr
+  max_iters = TrainConfig.max_iters
+
   print(f"\nStarting training for {max_iters:,} iterations...")
   print(f"Batch size: {batch_size}, Block size: {block_size}")
   print(f"Gradient accumulation steps: {gradient_accumulation_steps}")
   print(f"Effective batch size: {batch_size * gradient_accumulation_steps}")
-  
+
   # Training loop
   model.train()
   step = 0
   start_time = time.time()
-  
+
   losses = estimate_loss(model, train_data, val_data, eval_iters, batch_size, block_size, device)
   print(f"\nStep {step:6d} | Train Loss: {losses['train']:.4f} | Val Loss: {losses['val']:.4f} | " f"Train Acc: {losses['train_acc']:.3f} | Val Acc: {losses['val_acc']:.3f}")
-  
+
   while step < max_iters:
     lr = get_lr(step, warmup_steps, lr_decay_steps, learning_rate, min_lr)
     for param_group in optimizer.param_groups:
       param_group['lr'] = lr
-    
+
     # Evaluate and log
     if step % eval_interval == 0 and step > 0:
       losses = estimate_loss(model, train_data, val_data, eval_iters, batch_size, block_size, device)
       elapsed_time = time.time() - start_time
       avg_time_per_step = elapsed_time / step if step > 0 else 0
-      
+
       print(f"Step {step:6d} | Train Loss: {losses['train']:.4f} | Val Loss: {losses['val']:.4f} | " f"Train Acc: {losses['train_acc']:.3f} | Val Acc: {losses['val_acc']:.3f} | " f"LR: {lr:.2e} | Time/Step: {avg_time_per_step:.2f}s")
 
     # Training step
     optimizer.zero_grad(set_to_none=True)
     loss_accum = 0.0
-    
+
     for micro_step in range(gradient_accumulation_steps):
       X, Y = get_batch(train_data, batch_size, block_size, device)
-      
+
       with ctx:
         logits, loss = model(X, Y)
         loss = loss / gradient_accumulation_steps
         loss_accum += loss.detach()
-      
       scaler.scale(loss).backward()
-    
+
     # Gradient clipping
     if grad_clip != 0.0:
       scaler.unscale_(optimizer)
       torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    
+
     # Optimizer step
     scaler.step(optimizer)
     scaler.update()
-    
+
     step += 1
-    
+
     # Log training progress
     if step % log_interval == 0:
       elapsed_time = time.time() - start_time
       avg_time_per_step = elapsed_time / step
       print(f"Step {step:6d} | Loss: {loss_accum:.4f} | LR: {lr:.2e} | Time/Step: {avg_time_per_step:.2f}s")
-  
+
   print(f"\nTraining completed! Total time: {(time.time() - start_time) / 3600:.2f} hours")
-  
+
   # Save final model
   checkpoint = {
     'model_state_dict': model.state_dict(),
     'optimizer_state_dict': optimizer.state_dict(),
-    'model_config': model_config,
-    'train_config': train_config,
+    'model_config': vars(ModelConfig),
+    'train_config': vars(TrainConfig),
     'step': step,
   }
-  
-  torch.save(checkpoint, f'{model_name}_final.pt')
-  print(f"Model saved as {model_name}_final.pt")
-  
+
+  model_name = "consolidated_00"
+  torch.save(checkpoint, f'{model_name}.pt')
+  print(f"Model saved as {model_name}.pt")
+
   # Final evaluation
   losses = estimate_loss(model, train_data, val_data, eval_iters, batch_size, block_size, device)
   print(f"\nFinal Results:")
